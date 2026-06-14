@@ -28,7 +28,10 @@ func Run(t *testing.T, open func(t *testing.T) store.Store) {
 	t.Run("Roster", func(t *testing.T) { testRoster(t, open(t)) })
 	t.Run("Submissions", func(t *testing.T) { testSubmissions(t, open(t)) })
 	t.Run("SubmissionErrConflict", func(t *testing.T) { testSubmissionConflict(t, open(t)) })
+	t.Run("FindSubmissionByRepo", func(t *testing.T) { testFindSubmissionByRepo(t, open(t)) })
+	t.Run("SubmissionsByRosterUsername", func(t *testing.T) { testSubmissionsByRosterUsername(t, open(t)) })
 	t.Run("Grades", func(t *testing.T) { testGrades(t, open(t)) })
+	t.Run("GradesBySubmission", func(t *testing.T) { testGradesBySubmission(t, open(t)) })
 	t.Run("GradingRuns", func(t *testing.T) { testGradingRuns(t, open(t)) })
 	t.Run("JobIdempotency", func(t *testing.T) { testJobIdempotency(t, open(t)) })
 	t.Run("JobClaimOrdering", func(t *testing.T) { testJobClaimOrdering(t, open(t)) })
@@ -342,6 +345,88 @@ func testSubmissionConflict(t *testing.T, st store.Store) {
 	}
 }
 
+func testFindSubmissionByRepo(t *testing.T, st store.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	_ = st.CreateClassroom(ctx, &store.Classroom{ID: "c1", Name: "CS101", Host: adapter.HostGitHub, HostNamespace: "org"})
+	_ = st.CreateAssignment(ctx, &store.Assignment{ID: "a1", ClassroomID: "c1", Title: "HW1", Slug: "hw-1", TemplateRef: adapter.TemplateRef{Host: adapter.HostGitHub, Namespace: "org", Name: "tpl"}, Type: store.AssignmentIndividual, GradingSpec: "grading.json"})
+	_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r1", ClassroomID: "c1", Host: adapter.HostGitHub, HostUsername: "octocat", Status: store.RosterActive})
+	_ = st.CreateSubmission(ctx, &store.Submission{
+		ID: "s1", AssignmentID: "a1", RosterEntryID: "r1", Status: "active",
+		Repo: adapter.RepoRef{Host: adapter.HostGitHub, Namespace: "org", Name: "hw-1-octocat"},
+	})
+
+	// Hit.
+	got, err := st.FindSubmissionByRepo(ctx, adapter.HostGitHub, "org", "hw-1-octocat")
+	if err != nil {
+		t.Fatalf("FindSubmissionByRepo: %v", err)
+	}
+	if got.ID != "s1" {
+		t.Errorf("ID = %q, want s1", got.ID)
+	}
+
+	// Miss: wrong name.
+	if _, err := st.FindSubmissionByRepo(ctx, adapter.HostGitHub, "org", "nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("wrong name: got %v, want ErrNotFound", err)
+	}
+	// Miss: wrong host (same ns/name).
+	if _, err := st.FindSubmissionByRepo(ctx, adapter.HostForgejo, "org", "hw-1-octocat"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("wrong host: got %v, want ErrNotFound", err)
+	}
+}
+
+func testSubmissionsByRosterUsername(t *testing.T, st store.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	// One student (octocat) enrolled in two classrooms, each with a submission;
+	// plus a second student (monalisa) whose submission must not leak.
+	_ = st.CreateClassroom(ctx, &store.Classroom{ID: "c1", Name: "CS101", Host: adapter.HostGitHub, HostNamespace: "org1"})
+	_ = st.CreateClassroom(ctx, &store.Classroom{ID: "c2", Name: "CS201", Host: adapter.HostGitHub, HostNamespace: "org2"})
+	_ = st.CreateAssignment(ctx, &store.Assignment{ID: "a1", ClassroomID: "c1", Title: "HW1", Slug: "hw-1", TemplateRef: adapter.TemplateRef{Host: adapter.HostGitHub, Namespace: "org1", Name: "tpl"}, Type: store.AssignmentIndividual, GradingSpec: "grading.json"})
+	_ = st.CreateAssignment(ctx, &store.Assignment{ID: "a2", ClassroomID: "c2", Title: "HW2", Slug: "hw-2", TemplateRef: adapter.TemplateRef{Host: adapter.HostGitHub, Namespace: "org2", Name: "tpl"}, Type: store.AssignmentIndividual, GradingSpec: "grading.json"})
+
+	// Same username in both classrooms (distinct roster rows).
+	_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r1", ClassroomID: "c1", Host: adapter.HostGitHub, HostUsername: "octocat", Status: store.RosterActive})
+	_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r2", ClassroomID: "c2", Host: adapter.HostGitHub, HostUsername: "octocat", Status: store.RosterActive})
+	_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r3", ClassroomID: "c1", Host: adapter.HostGitHub, HostUsername: "monalisa", Status: store.RosterActive})
+
+	older := time.Now().UTC().Add(-2 * time.Hour)
+	newer := time.Now().UTC().Add(-1 * time.Hour)
+	_ = st.CreateSubmission(ctx, &store.Submission{ID: "s1", AssignmentID: "a1", RosterEntryID: "r1", Status: "active", LastActivityAt: &older})
+	_ = st.CreateSubmission(ctx, &store.Submission{ID: "s2", AssignmentID: "a2", RosterEntryID: "r2", Status: "active", LastActivityAt: &newer})
+	_ = st.CreateSubmission(ctx, &store.Submission{ID: "s3", AssignmentID: "a1", RosterEntryID: "r3", Status: "active"})
+
+	got, err := st.ListSubmissionsByRosterUsername(ctx, adapter.HostGitHub, "octocat")
+	if err != nil {
+		t.Fatalf("ListSubmissionsByRosterUsername: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("octocat submissions = %d, want 2 (across two classrooms)", len(got))
+	}
+	// Newest-activity-first: s2 (newer) before s1 (older).
+	if got[0].ID != "s2" || got[1].ID != "s1" {
+		t.Errorf("order = [%s, %s], want [s2, s1] (newest activity first)", got[0].ID, got[1].ID)
+	}
+	// Isolation: monalisa sees only her own.
+	other, err := st.ListSubmissionsByRosterUsername(ctx, adapter.HostGitHub, "monalisa")
+	if err != nil {
+		t.Fatalf("ListSubmissionsByRosterUsername(monalisa): %v", err)
+	}
+	if len(other) != 1 || other[0].ID != "s3" {
+		t.Fatalf("monalisa submissions = %+v, want exactly [s3]", other)
+	}
+	// Wrong host returns nothing.
+	none, err := st.ListSubmissionsByRosterUsername(ctx, adapter.HostForgejo, "octocat")
+	if err != nil {
+		t.Fatalf("ListSubmissionsByRosterUsername(forgejo): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("wrong-host submissions = %d, want 0", len(none))
+	}
+}
+
 func testGrades(t *testing.T, st store.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -371,6 +456,44 @@ func testGrades(t *testing.T, st store.Store) {
 	}
 	if latest.Score != 90 {
 		t.Errorf("Score = %v, want 90", latest.Score)
+	}
+}
+
+func testGradesBySubmission(t *testing.T, st store.Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	_ = st.CreateClassroom(ctx, &store.Classroom{ID: "c1", Name: "CS101", Host: adapter.HostGitHub, HostNamespace: "org"})
+	_ = st.CreateAssignment(ctx, &store.Assignment{ID: "a1", ClassroomID: "c1", Title: "HW1", Slug: "hw-1", TemplateRef: adapter.TemplateRef{Host: adapter.HostGitHub, Namespace: "org", Name: "tpl"}, Type: store.AssignmentIndividual, GradingSpec: "grading.json"})
+	_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r1", ClassroomID: "c1", Host: adapter.HostGitHub, HostUsername: "octocat", Status: store.RosterActive})
+	_ = st.CreateSubmission(ctx, &store.Submission{ID: "s1", AssignmentID: "a1", RosterEntryID: "r1", Status: "active"})
+
+	// Empty history is not an error — an ungraded submission returns [].
+	empty, err := st.ListGradesBySubmission(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ListGradesBySubmission empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("empty history len = %d, want 0", len(empty))
+	}
+
+	t0 := time.Now().UTC().Add(-3 * time.Hour)
+	t1 := time.Now().UTC().Add(-2 * time.Hour)
+	t2 := time.Now().UTC().Add(-1 * time.Hour)
+	_ = st.CreateGrade(ctx, &store.Grade{ID: "g1", SubmissionID: "s1", Score: 50, MaxScore: 100, GradedAt: t0})
+	_ = st.CreateGrade(ctx, &store.Grade{ID: "g2", SubmissionID: "s1", Score: 70, MaxScore: 100, GradedAt: t1})
+	_ = st.CreateGrade(ctx, &store.Grade{ID: "g3", SubmissionID: "s1", Score: 95, MaxScore: 100, GradedAt: t2})
+
+	hist, err := st.ListGradesBySubmission(ctx, "s1")
+	if err != nil {
+		t.Fatalf("ListGradesBySubmission: %v", err)
+	}
+	if len(hist) != 3 {
+		t.Fatalf("history len = %d, want 3", len(hist))
+	}
+	// Most recent first.
+	if hist[0].ID != "g3" || hist[1].ID != "g2" || hist[2].ID != "g1" {
+		t.Errorf("order = [%s,%s,%s], want [g3,g2,g1]", hist[0].ID, hist[1].ID, hist[2].ID)
 	}
 }
 

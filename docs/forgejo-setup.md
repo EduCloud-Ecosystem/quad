@@ -163,7 +163,8 @@ Quad redirects them to Forgejo's OAuth consent page. After approval, it:
    email, or SIS id).
 2. Creates a roster entry (or finds the existing one).
 3. Provisions `<student-username>-hw-1` under `cs101-spring26`.
-4. Returns `{"status":"accepted","assignment":"hw-1","username":"<student>"}`.
+4. Starts a student session and **redirects the student to `/me`**, where they see
+   their repo link, deadline, grading status, score, and per-test results.
 
 If `join_policy` is `"roster"` and the student's username is not pre-listed, Quad
 returns `403 {"error":"not on roster","username":"<student>"}` and enqueues nothing.
@@ -193,7 +194,34 @@ curl -s -X POST http://localhost:8080/classrooms/<classroom-id>/assignments/<ass
 
 ---
 
-## 9. Known Forgejo / Gitea quirks
+## 9. Webhooks (auto-regrade on push)
+
+With a webhook configured, a student's `git push` re-runs grading automatically and
+their `/me` page updates live. Quad registers the webhook on each repo when
+`QUAD_WEBHOOK_URL` is set, signing deliveries with the secret below.
+
+```sh
+# FULL receiver URL, used verbatim. It must include the /webhooks/forgejo path and
+# be reachable BY THE FORGEJO SERVER. The secret must match on both sides.
+export QUAD_WEBHOOK_URL=https://your-quad-host/webhooks/forgejo
+export QUAD_FORGEJO_WEBHOOK_SECRET=$(openssl rand -hex 32)   # also covers host: gitea
+```
+
+Restart Quad and confirm the startup summary shows the webhook URL and
+`webhook secret [forgejo]: set` (and `[gitea]: set`). New provisions register the
+webhook automatically; re-provision existing repos, or add the webhook by hand in
+the repo's **Settings → Webhooks** pointing at the same URL and secret.
+
+> **Reachability gotcha (read this).** `QUAD_WEBHOOK_URL` is called by the **Forgejo
+> server**, not your laptop. If Forgejo runs in a container, `localhost` is the
+> container itself — use the host address, e.g.
+> `http://host.docker.internal:8080/webhooks/forgejo` on Docker Desktop, or the
+> machine's LAN IP. Test reachability from inside the container
+> (`curl` the URL) before debugging anything else.
+
+---
+
+## 10. Known Forgejo / Gitea quirks & troubleshooting
 
 | Quirk | Details |
 |---|---|
@@ -202,3 +230,5 @@ curl -s -X POST http://localhost:8080/classrooms/<classroom-id>/assignments/<ass
 | **`IncludeAllBranches`** | Gitea's generate endpoint copies only the default branch. `CreateRepoOptions.IncludeAllBranches` is accepted but silently ignored — a known upstream limitation. |
 | **Org already exists** | `EnsureNamespace` treats a 422 with an "already exists" body as success (idempotent). |
 | **HTTPS clone username** | `oauth2` is the widely-supported convention for Forgejo HTTPS token auth. If clones fail, try `QUAD_FORGEJO_GIT_USERNAME=<token-owner>`. |
+| **Webhook delivery `401`** | The signature didn't verify: the secret in Forgejo's webhook config doesn't match `QUAD_FORGEJO_WEBHOOK_SECRET`. Re-set both to the same value. |
+| **Webhook `204`, no grading** | The push wasn't matched to a submission — wrong repo namespace/name (the repo isn't a provisioned submission), or the delivery was a non-push event (e.g. a ping). Pushes to tracked student repos return `202`. |

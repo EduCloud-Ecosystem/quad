@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,6 +82,17 @@ func New(cfg Config) (*Adapter, error) {
 
 // Host returns the host this adapter targets.
 func (a *Adapter) Host() adapter.Host { return adapter.HostGitHub }
+
+// RepoWebURL returns the browser URL for a repo. For github.com the web host is
+// github.com (distinct from the api.github.com API host); for GHES the API base
+// is https://host/api/v3, so the web host is that with the /api/v3 suffix removed.
+func (a *Adapter) RepoWebURL(repo adapter.RepoRef) string {
+	web := "https://github.com"
+	if a.baseURL != defaultAPIBase {
+		web = strings.TrimSuffix(strings.TrimRight(a.baseURL, "/"), "/api/v3")
+	}
+	return web + "/" + repo.Namespace + "/" + repo.Name
+}
 
 // --- authentication -------------------------------------------------------
 

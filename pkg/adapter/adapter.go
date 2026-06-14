@@ -125,6 +125,11 @@ type Adapter interface {
 	// Host returns the host this adapter targets.
 	Host() Host
 
+	// RepoWebURL returns the browser-facing URL of a repository on this host, used
+	// to give students a clickable link to their own repo. It is a pure string
+	// builder (no network call).
+	RepoWebURL(repo RepoRef) string
+
 	// EnsureNamespace makes sure the org/group exists, creating it if needed.
 	EnsureNamespace(ctx context.Context, slug string) (NamespaceRef, error)
 

@@ -321,6 +321,48 @@ production, run the server as a dedicated non-root user.
 `QUAD_GRADER=local-exec-unsafe` selects the host exec runner, which has **no
 isolation** (only a timeout) and is for trusted/local material only.
 
+## Webhooks (auto-regrade on push)
+
+When `QUAD_WEBHOOK_URL` is set, Quad registers a push webhook on each provisioned
+repo. A student `git push` then hits the receiver at `POST /webhooks/{host}`, which
+verifies the delivery's HMAC signature and enqueues a regrade keyed to the head
+commit (so each push grades once; a new commit regrades).
+
+```sh
+# Full receiver URL, used verbatim — include the host segment matching your
+# classroom host. It must be reachable BY THE GIT HOST, not just by you.
+export QUAD_WEBHOOK_URL=https://your-host/webhooks/forgejo   # or /webhooks/github, /webhooks/gitea
+
+# Per-host signing secret; set the same value in the host's webhook config.
+export QUAD_FORGEJO_WEBHOOK_SECRET=$(openssl rand -hex 32)   # covers forgejo AND gitea
+export QUAD_GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
+```
+
+A host with no configured secret has its deliveries rejected (the receiver returns
+`404`); a delivery whose signature doesn't match returns `401`. The startup summary
+prints the webhook URL and the set/unset state of each host's secret.
+
+> **Reachability gotchas.** `localhost` from inside a Forgejo container is the
+> container, not your machine — use the host address (e.g.
+> `http://host.docker.internal:8080/webhooks/forgejo` on Docker Desktop). Cloud
+> GitHub cannot reach `localhost` at all; use a tunnel for local testing. See the
+> [Forgejo](docs/forgejo-setup.md) and [GitHub](docs/github-setup.md) guides.
+
+## Student experience
+
+After accepting an assignment, a student lands on **`/me`** — a lightweight,
+framework-free page (served whether or not the React dashboard is mounted). There
+they see each of their submissions: assignment and classroom, a link to their repo,
+the deadline, submission status, live grading status, the latest score as
+`score / max_score`, and an expandable per-test breakdown plus attempt history.
+Returning students sign back in at **`/student/login`**.
+
+The student API is strictly own-data: `GET /me/work` and `GET /me/work/{id}` are
+scoped to the caller's Git username and host, and a request for a submission the
+caller doesn't own returns `404` — never revealing another student's work. As
+everywhere in Quad, no student names, SIS IDs, or plaintext emails are stored or
+shown; the identity anchor is the Git username.
+
 ## Licensing
 
 A deliberate split (see [`DESIGN.md`](DESIGN.md) §11):

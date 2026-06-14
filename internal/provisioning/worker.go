@@ -27,6 +27,10 @@ type Worker struct {
 	Adapters   map[adapter.Host]adapter.Adapter
 	Grader     Grader // optional; nil means grade jobs fail with a clear error
 	WebhookURL string // if set, a push webhook is ensured on each provisioned repo
+	// WebhookSecrets is the per-host secret the host uses to sign push deliveries,
+	// matched by the receiver to verify them. Keyed by adapter.Host; a missing key
+	// means the webhook is registered without a secret (deliveries unverifiable).
+	WebhookSecrets map[adapter.Host]string
 
 	MaxAttempts int                             // default 5
 	Backoff     func(attempt int) time.Duration // default capped exponential
@@ -172,8 +176,13 @@ func (w *Worker) createRepo(ctx context.Context, submissionID string) error {
 		return fmt.Errorf("add collaborator: %w", err)
 	}
 	if w.WebhookURL != "" {
-		// Best-effort: a missing webhook should not fail provisioning.
-		_ = ad.EnsureWebhook(ctx, repo, adapter.WebhookSpec{URL: w.WebhookURL, Events: []string{"push"}})
+		// Best-effort: a missing webhook should not fail provisioning. The per-host
+		// secret lets the receiver verify deliveries' HMAC signatures.
+		_ = ad.EnsureWebhook(ctx, repo, adapter.WebhookSpec{
+			URL:    w.WebhookURL,
+			Secret: w.WebhookSecrets[cls.Host],
+			Events: []string{"push"},
+		})
 	}
 
 	sub.Repo = repo

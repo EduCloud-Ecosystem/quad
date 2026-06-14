@@ -129,11 +129,15 @@ func TestAcceptThenCallbackSelfClaim(t *testing.T) {
 		t.Fatal("expected a state in the redirect URL")
 	}
 
-	// 2) callback -> binds the username and enqueues provisioning.
+	// 2) callback -> binds the username, enqueues provisioning, and (browser-driven)
+	// redirects the student to their own-work page with a session cookie.
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/callback?code=xyz&state="+state, nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("callback status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("callback status = %d, want 302; body=%s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/me" {
+		t.Fatalf("callback redirect = %q, want /me", loc)
 	}
 
 	re, err := st.FindRosterEntryByUsername(ctx, "c1", "alice")
@@ -679,11 +683,12 @@ func TestMultiHostClaimUsesCorrectResolver(t *testing.T) {
 		t.Fatal("no state in accept redirect")
 	}
 
-	// Step 2: /callback with the state → should use the Forgejo resolver.
+	// Step 2: /callback with the state → should use the Forgejo resolver, then
+	// redirect the student to /me.
 	cb := httptest.NewRecorder()
 	srv.ServeHTTP(cb, httptest.NewRequest(http.MethodGet, "/auth/callback?code=x&state="+state, nil))
-	if cb.Code != http.StatusOK {
-		t.Fatalf("callback = %d, want 200; body=%s", cb.Code, cb.Body.String())
+	if cb.Code != http.StatusFound {
+		t.Fatalf("callback = %d, want 302; body=%s", cb.Code, cb.Body.String())
 	}
 
 	// The Forgejo resolver returned "fg-student" — that username should be bound.
@@ -893,6 +898,9 @@ func TestWorkerSubmissionTerminalFailure(t *testing.T) {
 type fakeWorkerAdapter struct{}
 
 func (f *fakeWorkerAdapter) Host() adapter.Host { return adapter.HostGitHub }
+func (f *fakeWorkerAdapter) RepoWebURL(repo adapter.RepoRef) string {
+	return "https://github.test/" + repo.Namespace + "/" + repo.Name
+}
 func (f *fakeWorkerAdapter) EnsureNamespace(_ context.Context, slug string) (adapter.NamespaceRef, error) {
 	return adapter.NamespaceRef{Host: adapter.HostGitHub, Slug: slug}, nil
 }
@@ -1020,8 +1028,11 @@ func TestRosterPolicyAllowsListedStudent(t *testing.T) {
 	})
 
 	rec := doAcceptCallback(srv, "a1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (redirect to /me); body=%s", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "/me" {
+		t.Fatalf("redirect = %q, want /me", loc)
 	}
 	if len(q.jobs) == 0 {
 		t.Error("want at least one provisioning job enqueued")
@@ -1089,8 +1100,8 @@ func TestGiteaClassroomEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := doAcceptCallback(srv, "a1")
-	if claim.Code != http.StatusOK {
-		t.Fatalf("claim = %d, want 200; body=%s", claim.Code, claim.Body.String())
+	if claim.Code != http.StatusFound {
+		t.Fatalf("claim = %d, want 302 (redirect to /me); body=%s", claim.Code, claim.Body.String())
 	}
 	re, err := st.FindRosterEntryByUsername(ctx, cls.ID, "alice")
 	if err != nil {

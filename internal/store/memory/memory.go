@@ -6,6 +6,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -263,6 +264,60 @@ func (m *Store) FindSubmission(_ context.Context, assignmentID, rosterEntryID st
 	return nil, store.ErrNotFound
 }
 
+func (m *Store) FindSubmissionByRepo(_ context.Context, host adapter.Host, namespace, name string) (*store.Submission, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, s := range m.submissions {
+		if s.Repo.Host == host && s.Repo.Namespace == namespace && s.Repo.Name == name {
+			s := s
+			return &s, nil
+		}
+	}
+	return nil, store.ErrNotFound
+}
+
+func (m *Store) ListSubmissionsByRosterUsername(_ context.Context, host adapter.Host, username string) ([]*store.Submission, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	// The roster entries owned by this (host, username) identify the student's
+	// submissions. Only the Git username is matched — no name/email/SIS involved.
+	rosterIDs := map[string]bool{}
+	for _, r := range m.roster {
+		if r.Host == host && r.HostUsername == username {
+			rosterIDs[r.ID] = true
+		}
+	}
+	var out []*store.Submission
+	for _, s := range m.submissions {
+		if rosterIDs[s.RosterEntryID] {
+			s := s
+			out = append(out, &s)
+		}
+	}
+	sortSubmissionsByActivityDesc(out)
+	return out, nil
+}
+
+// sortSubmissionsByActivityDesc orders newest-activity-first; a nil LastActivityAt
+// sorts last. Ties break by ID for a stable order.
+func sortSubmissionsByActivityDesc(subs []*store.Submission) {
+	sort.SliceStable(subs, func(i, j int) bool {
+		a, b := subs[i].LastActivityAt, subs[j].LastActivityAt
+		switch {
+		case a == nil && b == nil:
+			return subs[i].ID < subs[j].ID
+		case a == nil:
+			return false
+		case b == nil:
+			return true
+		case a.Equal(*b):
+			return subs[i].ID < subs[j].ID
+		default:
+			return a.After(*b)
+		}
+	})
+}
+
 func (m *Store) UpdateSubmission(_ context.Context, s *store.Submission) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -330,6 +385,26 @@ func (m *Store) LatestGradeForSubmission(_ context.Context, submissionID string)
 		return nil, store.ErrNotFound
 	}
 	return latest, nil
+}
+
+func (m *Store) ListGradesBySubmission(_ context.Context, submissionID string) ([]*store.Grade, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []*store.Grade
+	for _, g := range m.grades {
+		if g.SubmissionID == submissionID {
+			g := g
+			out = append(out, &g)
+		}
+	}
+	// Most recent first; ties break by ID for a stable order.
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].GradedAt.Equal(out[j].GradedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].GradedAt.After(out[j].GradedAt)
+	})
+	return out, nil
 }
 
 // --- grading runs ---

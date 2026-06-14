@@ -101,6 +101,13 @@ func NewWithHost(cfg Config, host adapter.Host) (*Adapter, error) {
 // Host returns the host this adapter was constructed for (Forgejo or Gitea).
 func (a *Adapter) Host() adapter.Host { return a.host }
 
+// RepoWebURL returns the browser URL for a repo. baseURL is the instance root
+// plus /api/v1; the web URL is the instance root with that suffix removed.
+func (a *Adapter) RepoWebURL(repo adapter.RepoRef) string {
+	web := strings.TrimSuffix(a.baseURL, "/api/v1")
+	return web + "/" + repo.Namespace + "/" + repo.Name
+}
+
 // --- HTTP plumbing (mirrors pkg/adapter/github) ---------------------------
 
 type apiError struct {

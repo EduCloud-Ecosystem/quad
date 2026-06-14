@@ -156,8 +156,10 @@ CREATE TABLE IF NOT EXISTS grading_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_roster_classroom      ON roster_entries (classroom_id);
+CREATE INDEX IF NOT EXISTS idx_roster_host_username  ON roster_entries (host, host_username);
 CREATE INDEX IF NOT EXISTS idx_assignments_classroom ON assignments (classroom_id);
 CREATE INDEX IF NOT EXISTS idx_submissions_assignment ON submissions (assignment_id);
+CREATE INDEX IF NOT EXISTS idx_submissions_repo       ON submissions (repo_host, repo_namespace, repo_name);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_scheduled ON provisioning_jobs (status, scheduled_at);
 `
 
@@ -571,6 +573,30 @@ func (s *Store) FindSubmission(ctx context.Context, assignmentID, rosterEntryID 
 	return sub, nil
 }
 
+func (s *Store) FindSubmissionByRepo(ctx context.Context, host adapter.Host, namespace, name string) (*store.Submission, error) {
+	sub := &store.Submission{}
+	err := scanSubmission(s.db.QueryRowContext(ctx,
+		`SELECT `+submissionCols+` FROM submissions WHERE repo_host=? AND repo_namespace=? AND repo_name=?`,
+		string(host), namespace, name), sub)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return sub, nil
+}
+
+func (s *Store) ListSubmissionsByRosterUsername(ctx context.Context, host adapter.Host, username string) ([]*store.Submission, error) {
+	// Join roster entries on (host, host_username) — the only identity anchor.
+	// NULL last_activity_at sorts last (newest activity first).
+	return s.querySubmissions(ctx,
+		`SELECT sub.id, sub.assignment_id, sub.roster_entry_id, sub.repo_host, sub.repo_namespace, sub.repo_name,
+		        sub.latest_commit, sub.last_activity_at, sub.status, sub.last_error
+		 FROM submissions sub
+		 JOIN roster_entries r ON r.id = sub.roster_entry_id
+		 WHERE r.host=? AND r.host_username=?
+		 ORDER BY sub.last_activity_at IS NULL, sub.last_activity_at DESC, sub.id`,
+		string(host), username)
+}
+
 func (s *Store) UpdateSubmission(ctx context.Context, sub *store.Submission) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE submissions SET repo_host=?, repo_namespace=?, repo_name=?, latest_commit=?, last_activity_at=?, status=?, last_error=? WHERE id=?`,
@@ -624,21 +650,45 @@ func (s *Store) CreateGrade(ctx context.Context, g *store.Grade) error {
 	return err
 }
 
-func (s *Store) LatestGradeForSubmission(ctx context.Context, submissionID string) (*store.Grade, error) {
+func scanGrade(r rowScanner, g *store.Grade) error {
 	var gradedAt string
-	g := &store.Grade{}
-	err := s.db.QueryRowContext(ctx,
-		`SELECT `+gradeCols+` FROM grades WHERE submission_id=? ORDER BY graded_at DESC LIMIT 1`, submissionID).
-		Scan(&g.ID, &g.SubmissionID, &g.Score, &g.MaxScore, &g.Breakdown, &g.RunID, &gradedAt)
-	if err != nil {
-		return nil, mapErr(err)
+	if err := r.Scan(&g.ID, &g.SubmissionID, &g.Score, &g.MaxScore, &g.Breakdown, &g.RunID, &gradedAt); err != nil {
+		return err
 	}
 	t, err := decodeTime(gradedAt)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	g.GradedAt = t
+	return nil
+}
+
+func (s *Store) LatestGradeForSubmission(ctx context.Context, submissionID string) (*store.Grade, error) {
+	g := &store.Grade{}
+	err := scanGrade(s.db.QueryRowContext(ctx,
+		`SELECT `+gradeCols+` FROM grades WHERE submission_id=? ORDER BY graded_at DESC LIMIT 1`, submissionID), g)
+	if err != nil {
+		return nil, mapErr(err)
+	}
 	return g, nil
+}
+
+func (s *Store) ListGradesBySubmission(ctx context.Context, submissionID string) ([]*store.Grade, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+gradeCols+` FROM grades WHERE submission_id=? ORDER BY graded_at DESC, id`, submissionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.Grade
+	for rows.Next() {
+		g := &store.Grade{}
+		if err := scanGrade(rows, g); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // --- grading runs ---------------------------------------------------------

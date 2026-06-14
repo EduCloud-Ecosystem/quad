@@ -106,3 +106,16 @@ func TestCreateRepoFromTemplateReVerifyOn422(t *testing.T) {
 		t.Fatalf("want 3 calls (RepoExists + generate + re-verify), got %d", calls)
 	}
 }
+
+func TestRepoWebURL(t *testing.T) {
+	// github.com: the web host differs from the api.github.com API host.
+	a := &Adapter{baseURL: defaultAPIBase}
+	if got := a.RepoWebURL(adapter.RepoRef{Namespace: "cs-dept", Name: "hw1-alice"}); got != "https://github.com/cs-dept/hw1-alice" {
+		t.Errorf("github.com web URL = %q", got)
+	}
+	// GHES: API base is https://host/api/v3 → web host is https://host.
+	g := &Adapter{baseURL: "https://ghe.example.edu/api/v3"}
+	if got := g.RepoWebURL(adapter.RepoRef{Namespace: "o", Name: "r"}); got != "https://ghe.example.edu/o/r" {
+		t.Errorf("GHES web URL = %q", got)
+	}
+}

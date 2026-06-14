@@ -806,3 +806,18 @@ func TestCreateRepoFromTemplate422BodySurfaced(t *testing.T) {
 		t.Errorf("error %q does not contain original 422 body", err.Error())
 	}
 }
+
+func TestRepoWebURL(t *testing.T) {
+	a, err := New(Config{BaseURL: "https://forgejo.example.org", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := a.RepoWebURL(adapter.RepoRef{Namespace: "cs101", Name: "hw1-bob"}); got != "https://forgejo.example.org/cs101/hw1-bob" {
+		t.Errorf("forgejo web URL = %q", got)
+	}
+	// A Gitea-constructed adapter builds the same shape.
+	g, _ := NewWithHost(Config{BaseURL: "https://gitea.example.org/", Token: "t"}, adapter.HostGitea)
+	if got := g.RepoWebURL(adapter.RepoRef{Namespace: "o", Name: "r"}); got != "https://gitea.example.org/o/r" {
+		t.Errorf("gitea web URL = %q", got)
+	}
+}

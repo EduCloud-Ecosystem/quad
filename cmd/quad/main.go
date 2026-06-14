@@ -30,7 +30,7 @@ import (
 // glance instead of hunting through scattered log lines.
 func logStartupSummary(storeKind string, adapters map[adapter.Host]adapter.Adapter,
 	resolvers map[adapter.Host]identity.Resolver, loginHost adapter.Host,
-	grader bool, webDir, webhookURL string) {
+	grader bool, webDir, webhookURL string, webhookSecrets map[adapter.Host]string) {
 
 	// Adapters
 	adapterHosts := make([]string, 0, len(adapters))
@@ -69,6 +69,26 @@ func logStartupSummary(storeKind string, adapters map[adapter.Host]adapter.Adapt
 		log.Printf("webhook URL: %s", webhookURL)
 	} else {
 		log.Printf("webhook URL: not set — push webhooks will not be registered")
+	}
+	// Webhook signing secrets per host (set/unset). A host without a secret cannot
+	// have its deliveries verified, so the receiver will reject them.
+	for _, h := range []adapter.Host{adapter.HostGitHub, adapter.HostForgejo, adapter.HostGitea} {
+		state := "unset — deliveries will be rejected (set QUAD_" + envHostKey(h) + "_WEBHOOK_SECRET)"
+		if webhookSecrets[h] != "" {
+			state = "set"
+		}
+		log.Printf("webhook secret [%s]: %s", h, state)
+	}
+}
+
+// envHostKey maps a host to the env-var infix used for its webhook secret.
+// Gitea shares Forgejo's QUAD_FORGEJO_WEBHOOK_SECRET.
+func envHostKey(h adapter.Host) string {
+	switch h {
+	case adapter.HostGitHub:
+		return "GITHUB"
+	default:
+		return "FORGEJO"
 	}
 }
 
@@ -141,11 +161,16 @@ func main() {
 		}
 	}
 
+	// Per-host webhook secrets sign push deliveries; the receiver verifies them.
+	// The Forgejo secret covers both forgejo and gitea (one Gitea-family instance).
+	webhookSecrets := webhookSecretsFromEnv()
+
 	worker := &provisioning.Worker{
-		Store:      st,
-		Adapters:   adapters,
-		WebhookURL: os.Getenv("QUAD_WEBHOOK_URL"),
-		Poll:       2 * time.Second,
+		Store:          st,
+		Adapters:       adapters,
+		WebhookURL:     os.Getenv("QUAD_WEBHOOK_URL"),
+		WebhookSecrets: webhookSecrets,
+		Poll:           2 * time.Second,
 	}
 
 	// Grading executes untrusted code. The runner is chosen explicitly via
@@ -165,7 +190,7 @@ func main() {
 	admins := splitCSV(os.Getenv("QUAD_ADMIN_USERS"))
 	authEnabled := os.Getenv("QUAD_AUTH_DISABLED") != "1" && len(admins) > 0
 
-	logStartupSummary(storeKind, adapters, resolvers, loginHost, grader != nil, webDir, os.Getenv("QUAD_WEBHOOK_URL"))
+	logStartupSummary(storeKind, adapters, resolvers, loginHost, grader != nil, webDir, os.Getenv("QUAD_WEBHOOK_URL"), webhookSecrets)
 
 	if !authEnabled {
 		log.Printf("WARNING: operator authentication is DISABLED — the management API and dashboard are unprotected; set QUAD_ADMIN_USERS (and operator OAuth) to enable it")
@@ -178,6 +203,7 @@ func main() {
 		Queue:            queue,
 		Resolvers:        resolvers,
 		Adapters:         adapters,
+		WebhookSecrets:   webhookSecrets,
 		LoginHost:        loginHost,
 		WebDir:           webDir,
 		AuthEnabled:      authEnabled,
@@ -288,6 +314,21 @@ func getenvDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// webhookSecretsFromEnv builds the per-host push-webhook signing secrets. The
+// Forgejo secret is registered under both forgejo and gitea, since a single
+// Gitea-family instance serves both host labels. Hosts with no secret are omitted.
+func webhookSecretsFromEnv() map[adapter.Host]string {
+	secrets := map[adapter.Host]string{}
+	if s := os.Getenv("QUAD_GITHUB_WEBHOOK_SECRET"); s != "" {
+		secrets[adapter.HostGitHub] = s
+	}
+	if s := os.Getenv("QUAD_FORGEJO_WEBHOOK_SECRET"); s != "" {
+		secrets[adapter.HostForgejo] = s
+		secrets[adapter.HostGitea] = s
+	}
+	return secrets
 }
 
 // forgejoConfigFromEnv reads the shared QUAD_FORGEJO_* configuration for the

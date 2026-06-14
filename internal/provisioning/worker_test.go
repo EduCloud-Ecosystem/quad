@@ -24,6 +24,9 @@ type fakeAdapter struct {
 }
 
 func (f *fakeAdapter) Host() adapter.Host { return adapter.HostGitHub }
+func (f *fakeAdapter) RepoWebURL(repo adapter.RepoRef) string {
+	return "https://github.test/" + repo.Namespace + "/" + repo.Name
+}
 
 func (f *fakeAdapter) EnsureNamespace(_ context.Context, slug string) (adapter.NamespaceRef, error) {
 	f.callOrder = append(f.callOrder, "EnsureNamespace")

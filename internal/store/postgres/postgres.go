@@ -419,6 +419,29 @@ func (s *Store) FindSubmission(ctx context.Context, assignmentID, rosterEntryID 
 	return sub, nil
 }
 
+func (s *Store) FindSubmissionByRepo(ctx context.Context, host adapter.Host, namespace, name string) (*store.Submission, error) {
+	sub := &store.Submission{}
+	err := scanSubmission(s.db.QueryRowContext(ctx,
+		`SELECT `+submissionCols+` FROM submissions WHERE repo_host=$1 AND repo_namespace=$2 AND repo_name=$3`,
+		string(host), namespace, name), sub)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return sub, nil
+}
+
+func (s *Store) ListSubmissionsByRosterUsername(ctx context.Context, host adapter.Host, username string) ([]*store.Submission, error) {
+	// Join roster entries on (host, host_username) — the only identity anchor.
+	return s.querySubmissions(ctx,
+		`SELECT sub.id, sub.assignment_id, sub.roster_entry_id, sub.repo_host, sub.repo_namespace, sub.repo_name,
+		        sub.latest_commit, sub.last_activity_at, sub.status, sub.last_error
+		 FROM submissions sub
+		 JOIN roster_entries r ON r.id = sub.roster_entry_id
+		 WHERE r.host=$1 AND r.host_username=$2
+		 ORDER BY sub.last_activity_at DESC NULLS LAST, sub.id`,
+		string(host), username)
+}
+
 func (s *Store) UpdateSubmission(ctx context.Context, sub *store.Submission) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE submissions SET repo_host=$2, repo_namespace=$3, repo_name=$4, latest_commit=$5, last_activity_at=$6, status=$7, last_error=$8 WHERE id=$1`,
@@ -469,15 +492,36 @@ func (s *Store) CreateGrade(ctx context.Context, g *store.Grade) error {
 	return err
 }
 
+func scanGrade(r rowScanner, g *store.Grade) error {
+	return r.Scan(&g.ID, &g.SubmissionID, &g.Score, &g.MaxScore, &g.Breakdown, &g.RunID, &g.GradedAt)
+}
+
 func (s *Store) LatestGradeForSubmission(ctx context.Context, submissionID string) (*store.Grade, error) {
 	g := &store.Grade{}
-	err := s.db.QueryRowContext(ctx,
-		`SELECT `+gradeCols+` FROM grades WHERE submission_id=$1 ORDER BY graded_at DESC LIMIT 1`, submissionID).
-		Scan(&g.ID, &g.SubmissionID, &g.Score, &g.MaxScore, &g.Breakdown, &g.RunID, &g.GradedAt)
+	err := scanGrade(s.db.QueryRowContext(ctx,
+		`SELECT `+gradeCols+` FROM grades WHERE submission_id=$1 ORDER BY graded_at DESC LIMIT 1`, submissionID), g)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return g, nil
+}
+
+func (s *Store) ListGradesBySubmission(ctx context.Context, submissionID string) ([]*store.Grade, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+gradeCols+` FROM grades WHERE submission_id=$1 ORDER BY graded_at DESC, id`, submissionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*store.Grade
+	for rows.Next() {
+		g := &store.Grade{}
+		if err := scanGrade(rows, g); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // ========================= grading runs =========================

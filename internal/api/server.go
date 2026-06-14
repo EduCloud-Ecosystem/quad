@@ -58,7 +58,11 @@ type Options struct {
 	// created for a host Quad can actually provision against — deriving the
 	// allowlist from runtime registration keeps it correct as hosts are added
 	// (e.g. both "forgejo" and "gitea" once the Gitea-family adapter is wired).
+	// The student API also uses them for RepoWebURL links.
 	Adapters map[adapter.Host]adapter.Adapter
+	// WebhookSecrets is the per-host secret used to verify incoming push-webhook
+	// HMAC signatures. A host with no secret here has its deliveries rejected.
+	WebhookSecrets map[adapter.Host]string
 }
 
 // Server routes and serves the control-plane API.
@@ -66,9 +70,11 @@ type Server struct {
 	store     store.Store
 	queue     provisioning.Queue
 	resolvers map[adapter.Host]identity.Resolver
+	adapters  map[adapter.Host]adapter.Adapter
 	// provisionHosts is the set of hosts with a registered adapter; classroom
 	// creation is restricted to these. Derived from Options.Adapters at New().
 	provisionHosts map[adapter.Host]bool
+	webhookSecrets map[adapter.Host]string
 	loginHost      adapter.Host
 	webDir         string
 	authEnabled    bool
@@ -94,12 +100,16 @@ type authFlow struct {
 	created      time.Time
 }
 
-// session is an authenticated operator session (kept in memory; operators
-// re-authenticate after a restart).
+// session is an authenticated session (kept in memory; users re-authenticate
+// after a restart). Both operators and students get sessions in the same map, so
+// isOperator MUST be checked before granting operator access — otherwise a
+// student session would satisfy operator routes (privilege escalation).
 type session struct {
-	userID   string
-	username string
-	created  time.Time
+	userID     string       // operator User.ID; empty for students (not Users)
+	username   string       // host username (the identity anchor)
+	host       adapter.Host // the host this identity belongs to
+	created    time.Time
+	isOperator bool // true only for allowlisted operator logins
 }
 
 // New constructs a Server with routes registered.
@@ -118,7 +128,9 @@ func New(opts Options) *Server {
 		store:            opts.Store,
 		queue:            opts.Queue,
 		resolvers:        opts.Resolvers,
+		adapters:         opts.Adapters,
 		provisionHosts:   provisionHosts,
+		webhookSecrets:   opts.WebhookSecrets,
 		loginHost:        opts.LoginHost,
 		webDir:           opts.WebDir,
 		authEnabled:      opts.AuthEnabled,
@@ -141,6 +153,15 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /auth/me", s.handleAuthMe)
 	s.mux.HandleFunc("POST /auth/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /assignments/{id}/accept", s.handleAccept) // student entry
+	s.mux.HandleFunc("POST /webhooks/{host}", s.handleWebhook)       // host push deliveries
+	s.mux.HandleFunc("GET /student/login", s.handleStudentLogin)     // returning student
+
+	// Student surface — authenticated by session (currentIdentity), scoped to the
+	// caller's own work; NOT admin-gated. /me serves the page itself (public so the
+	// page can render a sign-in link); the data routes require a session.
+	s.mux.HandleFunc("GET /me", s.handleStudentPage)
+	s.mux.HandleFunc("GET /me/work", s.handleMyWork)
+	s.mux.HandleFunc("GET /me/work/{submissionID}", s.handleMyWorkDetail)
 
 	// Operator-only (the whole management surface).
 	protect := s.requireOperator
@@ -234,21 +255,39 @@ func (s *Server) requireOperator(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) operatorFromCookie(r *http.Request) (*store.User, bool) {
-	c, err := r.Cookie(sessionCookie)
-	if err != nil {
+	sess, ok := s.sessionFromCookie(r)
+	if !ok || !sess.isOperator {
+		// A non-operator (student) session must not satisfy operator routes.
 		return nil, false
 	}
+	return &store.User{ID: sess.userID, Host: sess.host, HostUsername: sess.username}, true
+}
+
+// sessionFromCookie returns the live session for the request's cookie, expiring
+// it if past TTL. It does not distinguish operator from student.
+func (s *Server) sessionFromCookie(r *http.Request) (session, bool) {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return session{}, false
+	}
 	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
 	sess, ok := s.sessions[c.Value]
 	if ok && time.Since(sess.created) > sessionTTL {
 		delete(s.sessions, c.Value)
-		ok = false
+		return session{}, false
 	}
-	s.sessMu.Unlock()
+	return sess, ok
+}
+
+// currentIdentity returns the host + username of any authenticated session
+// (operator or student). It is the basis for student-scoped, own-data-only routes.
+func (s *Server) currentIdentity(r *http.Request) (host adapter.Host, username string, ok bool) {
+	sess, ok := s.sessionFromCookie(r)
 	if !ok {
-		return nil, false
+		return "", "", false
 	}
-	return &store.User{ID: sess.userID, Host: s.loginHost, HostUsername: sess.username}, true
+	return sess.host, sess.username, true
 }
 
 const sessionCookie = "quad_session"
@@ -275,6 +314,26 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	s.stMu.Lock()
 	s.pruneStatesLocked(now)
 	s.states[state] = authFlow{kind: "login", host: s.loginHost, created: now}
+	s.stMu.Unlock()
+	http.Redirect(w, r, resolver.AuthorizeURL(state), http.StatusFound)
+}
+
+// handleStudentLogin begins OAuth for a returning student. Unlike operator login
+// it applies no admin allowlist — any account on the host may sign in to view its
+// own work. Scope: the primary configured login host. (Per-host student login for
+// multi-host deployments is a future refinement; the accept flow already sets a
+// correct per-host session at enrollment time.)
+func (s *Server) handleStudentLogin(w http.ResponseWriter, r *http.Request) {
+	resolver, ok := s.resolvers[s.loginHost]
+	if !ok {
+		httpError(w, http.StatusInternalServerError, "student login is not configured")
+		return
+	}
+	state := id.New()
+	now := time.Now()
+	s.stMu.Lock()
+	s.pruneStatesLocked(now)
+	s.states[state] = authFlow{kind: "student_login", host: s.loginHost, created: now}
 	s.stMu.Unlock()
 	http.Redirect(w, r, resolver.AuthorizeURL(state), http.StatusFound)
 }
@@ -734,11 +793,16 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if flow.kind == "login" {
+	switch flow.kind {
+	case "login":
 		s.completeOperatorLogin(w, r, flow.host, username, hostUserID)
-		return
+	case "student_login":
+		// Returning student: no admin check, no provisioning — just a session.
+		s.startStudentSession(w, flow.host, username)
+		http.Redirect(w, r, "/me", http.StatusFound)
+	default: // "claim"
+		s.completeStudentClaim(w, r, flow.assignmentID, username)
 	}
-	s.completeStudentClaim(w, r, flow.assignmentID, username)
 }
 
 // completeOperatorLogin authorizes an operator against the allowlist, upserts
@@ -766,13 +830,31 @@ func (s *Server) completeOperatorLogin(w http.ResponseWriter, r *http.Request, h
 	now := time.Now()
 	s.sessMu.Lock()
 	s.pruneSessionsLocked(now)
-	s.sessions[token] = session{userID: u.ID, username: u.HostUsername, created: now}
+	s.sessions[token] = session{userID: u.ID, username: u.HostUsername, host: host, created: now, isOperator: true}
 	s.sessMu.Unlock()
+	s.setSessionCookie(w, token)
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// setSessionCookie writes the session cookie with the standard attributes shared
+// by operator and student logins.
+func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: token, Path: "/", HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Secure: s.cookieSecure,
 	})
-	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// startStudentSession mints a student session (no User row, not an operator) and
+// sets the cookie. Students are identified solely by their (host, username).
+func (s *Server) startStudentSession(w http.ResponseWriter, host adapter.Host, username string) {
+	token := newSessionToken()
+	now := time.Now()
+	s.sessMu.Lock()
+	s.pruneSessionsLocked(now)
+	s.sessions[token] = session{username: username, host: host, created: now, isOperator: false}
+	s.sessMu.Unlock()
+	s.setSessionCookie(w, token)
 }
 
 // completeStudentClaim binds a student's username to a roster entry and
@@ -850,11 +932,10 @@ func (s *Server) completeStudentClaim(w http.ResponseWriter, r *http.Request, as
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":     "accepted",
-		"assignment": asg.Slug,
-		"username":   username,
-	})
+	// The accept flow is browser-driven: give the student a session keyed to their
+	// (host, username) and land them on their own-work page.
+	s.startStudentSession(w, cls.Host, username)
+	http.Redirect(w, r, "/me", http.StatusFound)
 }
 
 func (s *Server) handleGradesCSV(w http.ResponseWriter, r *http.Request) {

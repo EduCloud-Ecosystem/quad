@@ -170,9 +170,36 @@ curl -s -X POST \
 # {"status":"grading","jobs_enqueued":N,"skipped_unprovisioned":M}
 ```
 
+After accepting, students land on **`/me`**, where they see their repo link,
+deadline, grading status, score, and per-test results; they return via
+`/student/login`.
+
 ---
 
-## 7. Troubleshooting
+## 7. Webhooks (auto-regrade on push)
+
+With a webhook configured, a student `git push` re-runs grading automatically and
+their `/me` page updates live. Quad registers the webhook on each repo when
+`QUAD_WEBHOOK_URL` is set, signing deliveries with the secret below.
+
+```sh
+# FULL receiver URL, used verbatim. It must include the /webhooks/github path and
+# be reachable BY GITHUB. The secret must match on both sides.
+export QUAD_WEBHOOK_URL=https://quad.cs-dept.edu/webhooks/github
+export QUAD_GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
+```
+
+Restart Quad and confirm the startup summary shows the webhook URL and
+`webhook secret [github]: set`.
+
+> **Reachability gotcha.** Cloud GitHub calls `QUAD_WEBHOOK_URL` from the internet,
+> so it **cannot reach `localhost`** or a private LAN address. For local testing,
+> expose Quad through a tunnel (e.g. an SSH/ngrok-style tunnel) and use that public
+> URL. In production, use your real public hostname.
+
+---
+
+## 8. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -182,6 +209,8 @@ curl -s -X POST \
 | Clone fails during grading (auth) | `QUAD_GIT_CLONE_TOKEN` is unset or lacks access to the private repo. For GHES, also set `QUAD_GITHUB_BASE_URL`. |
 | Operator login rejected | The username isn't in `QUAD_ADMIN_USERS`, or `QUAD_OPERATOR_HOST` isn't `github`. |
 | `unknown host "github" — valid hosts: …` on classroom create | The GitHub adapter isn't configured — check `QUAD_GITHUB_APP_ID`/`INSTALLATION_ID`/`PRIVATE_KEY_FILE`. |
+| Webhook delivery `401` | The signature didn't verify: the secret in the GitHub webhook config doesn't match `QUAD_GITHUB_WEBHOOK_SECRET`. Re-set both to the same value. |
+| Webhook `204`, no grading | The push wasn't matched to a submission — wrong repo namespace/name, or it was a non-push delivery (e.g. GitHub's `ping`). Pushes to tracked student repos return `202`. |
 
 ---
 

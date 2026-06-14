@@ -63,6 +63,14 @@ type Store interface {
 	CreateSubmission(ctx context.Context, s *Submission) error
 	GetSubmission(ctx context.Context, id string) (*Submission, error)
 	FindSubmission(ctx context.Context, assignmentID, rosterEntryID string) (*Submission, error)
+	// FindSubmissionByRepo maps a provisioned repo (host + namespace + name) back to
+	// its submission. The webhook receiver uses it to route an incoming push.
+	// Returns ErrNotFound when no submission owns that repo.
+	FindSubmissionByRepo(ctx context.Context, host adapter.Host, namespace, name string) (*Submission, error)
+	// ListSubmissionsByRosterUsername returns every submission belonging to a
+	// student, found by joining roster entries on (host, host_username). It powers
+	// the student's own-work view. Ordered newest-activity-first.
+	ListSubmissionsByRosterUsername(ctx context.Context, host adapter.Host, username string) ([]*Submission, error)
 	UpdateSubmission(ctx context.Context, s *Submission) error
 	ListSubmissionsByAssignment(ctx context.Context, assignmentID string) ([]*Submission, error)
 	ListSubmissionsByClassroom(ctx context.Context, classroomID string) ([]*Submission, error)
@@ -70,6 +78,9 @@ type Store interface {
 	// Grades.
 	CreateGrade(ctx context.Context, g *Grade) error
 	LatestGradeForSubmission(ctx context.Context, submissionID string) (*Grade, error)
+	// ListGradesBySubmission returns the full attempt history for a submission
+	// (most recent first), so a student can see how their score evolved.
+	ListGradesBySubmission(ctx context.Context, submissionID string) ([]*Grade, error)
 
 	// Grading runs (audit trail of each grading execution).
 	CreateGradingRun(ctx context.Context, run *GradingRun) error
