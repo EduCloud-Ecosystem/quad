@@ -1,0 +1,1 @@
+ALTER TABLE classrooms ADD COLUMN IF NOT EXISTS join_policy TEXT NOT NULL DEFAULT 'open';
