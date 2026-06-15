@@ -180,22 +180,23 @@ deadline, grading status, score, and per-test results; they return via
 
 With a webhook configured, a student `git push` re-runs grading automatically and
 their `/me` page updates live. Quad registers the webhook on each repo when
-`QUAD_WEBHOOK_URL` is set, signing deliveries with the secret below.
+`QUAD_WEBHOOK_BASE_URL` is set, appending `/webhooks/github` per repo and signing
+deliveries with the secret below.
 
 ```sh
-# FULL receiver URL, used verbatim. It must include the /webhooks/github path and
-# be reachable BY GITHUB. The secret must match on both sides.
-export QUAD_WEBHOOK_URL=https://quad.cs-dept.edu/webhooks/github
+# Public BASE URL of Quad. Quad appends /webhooks/github per repo. It must be
+# reachable BY GITHUB. The secret must match on both sides.
+export QUAD_WEBHOOK_BASE_URL=https://quad.cs-dept.edu
 export QUAD_GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
 ```
 
-Restart Quad and confirm the startup summary shows the webhook URL and
+Restart Quad and confirm the startup summary shows the webhook base URL and
 `webhook secret [github]: set`.
 
-> **Reachability gotcha.** Cloud GitHub calls `QUAD_WEBHOOK_URL` from the internet,
-> so it **cannot reach `localhost`** or a private LAN address. For local testing,
-> expose Quad through a tunnel (e.g. an SSH/ngrok-style tunnel) and use that public
-> URL. In production, use your real public hostname.
+> **Reachability gotcha.** Cloud GitHub calls the webhook from the internet, so it
+> **cannot reach `localhost`** or a private LAN address. For local testing, expose
+> Quad through a tunnel (e.g. an SSH/ngrok-style tunnel) and use that public URL as
+> `QUAD_WEBHOOK_BASE_URL`. In production, use your real public hostname.
 
 ---
 

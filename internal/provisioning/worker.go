@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/quad/quad/internal/store"
@@ -23,13 +24,17 @@ type Grader interface {
 // for the job's classroom. It is the rate-limited choke point in front of every
 // host write; jobs are retried with backoff and marked failed after MaxAttempts.
 type Worker struct {
-	Store      store.Store
-	Adapters   map[adapter.Host]adapter.Adapter
-	Grader     Grader // optional; nil means grade jobs fail with a clear error
-	WebhookURL string // if set, a push webhook is ensured on each provisioned repo
-	// WebhookSecrets is the per-host secret the host uses to sign push deliveries,
-	// matched by the receiver to verify them. Keyed by adapter.Host; a missing key
-	// means the webhook is registered without a secret (deliveries unverifiable).
+	Store    store.Store
+	Adapters map[adapter.Host]adapter.Adapter
+	Grader   Grader // optional; nil means grade jobs fail with a clear error
+	// WebhookBaseURL is the public base URL of this Quad instance (e.g.
+	// https://quad.example). When set, each provisioned repo gets a push webhook at
+	// <base>/webhooks/<host>, so a delivery always reaches the handler that knows
+	// how to verify that host (HMAC for github/gitea/forgejo; token for gitlab).
+	WebhookBaseURL string
+	// WebhookSecrets is the per-host secret the host uses to sign/identify push
+	// deliveries, matched by the receiver to verify them. Keyed by adapter.Host; a
+	// missing key means the webhook is registered without a secret (unverifiable).
 	WebhookSecrets map[adapter.Host]string
 
 	MaxAttempts int                             // default 5
@@ -175,11 +180,13 @@ func (w *Worker) createRepo(ctx context.Context, submissionID string) error {
 	if err := ad.SetCollaborator(ctx, repo, re.HostUsername, adapter.RoleWrite); err != nil {
 		return fmt.Errorf("add collaborator: %w", err)
 	}
-	if w.WebhookURL != "" {
-		// Best-effort: a missing webhook should not fail provisioning. The per-host
-		// secret lets the receiver verify deliveries' HMAC signatures.
+	if w.WebhookBaseURL != "" {
+		// Best-effort: a missing webhook should not fail provisioning. The URL is
+		// per-host (<base>/webhooks/<host>) so deliveries reach the right verifier;
+		// the per-host secret lets the receiver authenticate them.
+		hookURL := strings.TrimRight(w.WebhookBaseURL, "/") + "/webhooks/" + string(cls.Host)
 		_ = ad.EnsureWebhook(ctx, repo, adapter.WebhookSpec{
-			URL:    w.WebhookURL,
+			URL:    hookURL,
 			Secret: w.WebhookSecrets[cls.Host],
 			Events: []string{"push"},
 		})

@@ -23,6 +23,7 @@ import (
 	"github.com/quad/quad/pkg/adapter"
 	forgejoadapter "github.com/quad/quad/pkg/adapter/forgejo"
 	githubadapter "github.com/quad/quad/pkg/adapter/github"
+	gitlabadapter "github.com/quad/quad/pkg/adapter/gitlab"
 )
 
 // logStartupSummary emits a single structured startup block covering all wired
@@ -30,7 +31,7 @@ import (
 // glance instead of hunting through scattered log lines.
 func logStartupSummary(storeKind string, adapters map[adapter.Host]adapter.Adapter,
 	resolvers map[adapter.Host]identity.Resolver, loginHost adapter.Host,
-	grader bool, webDir, webhookURL string, webhookSecrets map[adapter.Host]string) {
+	grader bool, webDir, webhookBaseURL string, webhookSecrets map[adapter.Host]string) {
 
 	// Adapters
 	adapterHosts := make([]string, 0, len(adapters))
@@ -65,14 +66,14 @@ func logStartupSummary(storeKind string, adapters map[adapter.Host]adapter.Adapt
 	} else {
 		log.Printf("dashboard: not mounted — set QUAD_WEB_DIR=web/dist (status page at /)")
 	}
-	if webhookURL != "" {
-		log.Printf("webhook URL: %s", webhookURL)
+	if webhookBaseURL != "" {
+		log.Printf("webhook base URL: %s (per repo: %s/webhooks/<host>)", webhookBaseURL, strings.TrimRight(webhookBaseURL, "/"))
 	} else {
-		log.Printf("webhook URL: not set — push webhooks will not be registered")
+		log.Printf("webhook base URL: not set — push webhooks will not be registered")
 	}
 	// Webhook signing secrets per host (set/unset). A host without a secret cannot
 	// have its deliveries verified, so the receiver will reject them.
-	for _, h := range []adapter.Host{adapter.HostGitHub, adapter.HostForgejo, adapter.HostGitea} {
+	for _, h := range []adapter.Host{adapter.HostGitHub, adapter.HostForgejo, adapter.HostGitea, adapter.HostGitLab} {
 		state := "unset — deliveries will be rejected (set QUAD_" + envHostKey(h) + "_WEBHOOK_SECRET)"
 		if webhookSecrets[h] != "" {
 			state = "set"
@@ -87,6 +88,8 @@ func envHostKey(h adapter.Host) string {
 	switch h {
 	case adapter.HostGitHub:
 		return "GITHUB"
+	case adapter.HostGitLab:
+		return "GITLAB"
 	default:
 		return "FORGEJO"
 	}
@@ -126,7 +129,15 @@ func main() {
 			)
 		}
 	}
-	// Operator-login host: explicit env, else GitHub if present, else Forgejo.
+	if os.Getenv("QUAD_GITLAB_OAUTH_CLIENT_ID") != "" {
+		resolvers[adapter.HostGitLab] = identity.NewGitLab(
+			os.Getenv("QUAD_GITLAB_OAUTH_CLIENT_ID"),
+			os.Getenv("QUAD_GITLAB_OAUTH_CLIENT_SECRET"),
+			os.Getenv("QUAD_OAUTH_REDIRECT_URL"),
+			os.Getenv("QUAD_GITLAB_BASE_URL"),
+		)
+	}
+	// Operator-login host: explicit env, else GitHub, then Forgejo, then GitLab.
 	loginHost := adapter.Host(os.Getenv("QUAD_OPERATOR_HOST"))
 	if _, ok := resolvers[loginHost]; !ok {
 		switch {
@@ -134,6 +145,8 @@ func main() {
 			loginHost = adapter.HostGitHub
 		case resolvers[adapter.HostForgejo] != nil:
 			loginHost = adapter.HostForgejo
+		case resolvers[adapter.HostGitLab] != nil:
+			loginHost = adapter.HostGitLab
 		}
 	}
 
@@ -160,15 +173,21 @@ func main() {
 			adapters[host] = ad
 		}
 	}
+	if gl, err := gitlabAdapterFromEnv(); err != nil {
+		log.Printf("gitlab adapter not configured: %v (GitLab provisioning will fail until set)", err)
+	} else if gl != nil {
+		adapters[adapter.HostGitLab] = gl
+	}
 
 	// Per-host webhook secrets sign push deliveries; the receiver verifies them.
 	// The Forgejo secret covers both forgejo and gitea (one Gitea-family instance).
 	webhookSecrets := webhookSecretsFromEnv()
+	webhookBaseURL := webhookBaseURLFromEnv()
 
 	worker := &provisioning.Worker{
 		Store:          st,
 		Adapters:       adapters,
-		WebhookURL:     os.Getenv("QUAD_WEBHOOK_URL"),
+		WebhookBaseURL: webhookBaseURL,
 		WebhookSecrets: webhookSecrets,
 		Poll:           2 * time.Second,
 	}
@@ -190,7 +209,7 @@ func main() {
 	admins := splitCSV(os.Getenv("QUAD_ADMIN_USERS"))
 	authEnabled := os.Getenv("QUAD_AUTH_DISABLED") != "1" && len(admins) > 0
 
-	logStartupSummary(storeKind, adapters, resolvers, loginHost, grader != nil, webDir, os.Getenv("QUAD_WEBHOOK_URL"), webhookSecrets)
+	logStartupSummary(storeKind, adapters, resolvers, loginHost, grader != nil, webDir, webhookBaseURL, webhookSecrets)
 
 	if !authEnabled {
 		log.Printf("WARNING: operator authentication is DISABLED — the management API and dashboard are unprotected; set QUAD_ADMIN_USERS (and operator OAuth) to enable it")
@@ -277,6 +296,19 @@ func graderFromEnv(st store.Store) provisioning.Grader {
 			hosts[adapter.HostGitea] = creds
 		}
 	}
+	if tok := os.Getenv("QUAD_GITLAB_TOKEN"); tok != "" {
+		// GitLab HTTPS clone uses oauth2:<token> — oauth2 as the username (the
+		// opposite of Forgejo). Base URL defaults to gitlab.com.
+		glHost := "gitlab.com"
+		if h := hostFromURL(os.Getenv("QUAD_GITLAB_BASE_URL")); h != "" {
+			glHost = h
+		}
+		hosts[adapter.HostGitLab] = grading.CloneCreds{
+			Hostname: glHost,
+			Username: getenvDefault("QUAD_GITLAB_GIT_USERNAME", "oauth2"),
+			Token:    tok,
+		}
+	}
 	checkout := grading.NewGitCheckout(hosts)
 
 	switch os.Getenv("QUAD_GRADER") {
@@ -316,6 +348,21 @@ func getenvDefault(key, def string) string {
 	return def
 }
 
+// webhookBaseURLFromEnv resolves the public base URL Quad registers webhooks
+// against. The worker appends /webhooks/<host> per repo. QUAD_WEBHOOK_BASE_URL is
+// the current name; QUAD_WEBHOOK_URL is accepted as a deprecated alias (it used to
+// be a full URL, but is now treated as the base for forward compatibility).
+func webhookBaseURLFromEnv() string {
+	if base := os.Getenv("QUAD_WEBHOOK_BASE_URL"); base != "" {
+		return base
+	}
+	if legacy := os.Getenv("QUAD_WEBHOOK_URL"); legacy != "" {
+		log.Printf("note: QUAD_WEBHOOK_URL is deprecated — rename to QUAD_WEBHOOK_BASE_URL; it is now treated as a base URL and Quad appends /webhooks/<host> per repo")
+		return legacy
+	}
+	return ""
+}
+
 // webhookSecretsFromEnv builds the per-host push-webhook signing secrets. The
 // Forgejo secret is registered under both forgejo and gitea, since a single
 // Gitea-family instance serves both host labels. Hosts with no secret are omitted.
@@ -327,6 +374,9 @@ func webhookSecretsFromEnv() map[adapter.Host]string {
 	if s := os.Getenv("QUAD_FORGEJO_WEBHOOK_SECRET"); s != "" {
 		secrets[adapter.HostForgejo] = s
 		secrets[adapter.HostGitea] = s
+	}
+	if s := os.Getenv("QUAD_GITLAB_WEBHOOK_SECRET"); s != "" {
+		secrets[adapter.HostGitLab] = s
 	}
 	return secrets
 }
@@ -343,6 +393,19 @@ func forgejoConfigFromEnv() (*forgejoadapter.Config, error) {
 		return nil, fmt.Errorf("forgejo: set both QUAD_FORGEJO_BASE_URL and QUAD_FORGEJO_TOKEN")
 	}
 	return &forgejoadapter.Config{BaseURL: base, Token: tok}, nil
+}
+
+// gitlabAdapterFromEnv builds a GitLab adapter when QUAD_GITLAB_TOKEN is set.
+// BaseURL defaults to https://gitlab.com. Returns (nil, nil) when unconfigured.
+func gitlabAdapterFromEnv() (*gitlabadapter.Adapter, error) {
+	tok := os.Getenv("QUAD_GITLAB_TOKEN")
+	if tok == "" {
+		return nil, nil // not configured
+	}
+	return gitlabadapter.New(gitlabadapter.Config{
+		BaseURL: os.Getenv("QUAD_GITLAB_BASE_URL"), // empty → gitlab.com
+		Token:   tok,
+	})
 }
 
 // githubAdapterFromEnv builds a GitHub App adapter when the relevant environment

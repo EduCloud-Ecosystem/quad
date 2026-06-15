@@ -44,6 +44,7 @@ func newWebhookServer(t *testing.T, queue provisioning.Queue, graderConfigured b
 		WebhookSecrets: map[adapter.Host]string{
 			adapter.HostGitHub: testWebhookSecret,
 			adapter.HostGitea:  testWebhookSecret,
+			adapter.HostGitLab: testWebhookSecret,
 		},
 		GraderConfigured: graderConfigured,
 	})
@@ -58,6 +59,11 @@ func newWebhookServer(t *testing.T, queue provisioning.Queue, graderConfigured b
 		ID: "sub-gt", AssignmentID: "a2", RosterEntryID: "r2", Status: "active",
 		Repo: adapter.RepoRef{Host: adapter.HostGitea, Namespace: "cs-gitea", Name: "hw1-bob"},
 	})
+	// GitLab-hosted submission.
+	_ = st.CreateSubmission(ctx, &store.Submission{
+		ID: "sub-gl", AssignmentID: "a3", RosterEntryID: "r3", Status: "active",
+		Repo: adapter.RepoRef{Host: adapter.HostGitLab, Namespace: "cs101", Name: "hw1-carol"},
+	})
 	return srv, st
 }
 
@@ -67,6 +73,12 @@ func githubPush(ns, name, sha string) string {
 
 func giteaPush(ns, name, sha string) string {
 	return `{"after":"` + sha + `","repository":{"name":"` + name + `","owner":{"username":"` + ns + `"}}}`
+}
+
+// gitlabPush builds a GitLab push event: object_kind=push, checkout_sha as the
+// head, and the repo in project.path_with_namespace.
+func gitlabPush(ns, name, sha string) string {
+	return `{"object_kind":"push","checkout_sha":"` + sha + `","project":{"name":"` + name + `","path_with_namespace":"` + ns + `/` + name + `"}}`
 }
 
 func TestWebhookGitHubValidEnqueues(t *testing.T) {
@@ -190,10 +202,11 @@ func TestWebhookUnknownRepo204(t *testing.T) {
 
 func TestWebhookNoSecretForHost404(t *testing.T) {
 	q := &spyQueue{}
-	srv, _ := newWebhookServer(t, q, true) // only github+gitea secrets configured
+	srv, _ := newWebhookServer(t, q, true) // github+gitea+gitlab secrets configured
 
+	// An unconfigured host (no secret) cannot be trusted → 404.
 	body := githubPush("x", "y", "z")
-	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/bitbucket", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 
@@ -263,5 +276,101 @@ func TestWebhookSameShaDedupes(t *testing.T) {
 	}
 	if _, err := st.ClaimNextJob(ctx); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("second ClaimNextJob: %v, want ErrNotFound (deduped)", err)
+	}
+}
+
+// --- GitLab (token auth, not HMAC) ---------------------------------------
+
+func TestWebhookGitLabValidEnqueues(t *testing.T) {
+	q := &spyQueue{}
+	srv, st := newWebhookServer(t, q, true)
+
+	body := gitlabPush("cs101", "hw1-carol", "g1t1ab5ha")
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	req.Header.Set("X-Gitlab-Token", testWebhookSecret) // verbatim secret, not an HMAC
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	if len(q.jobs) != 1 || q.jobs[0].Target != "sub-gl" {
+		t.Fatalf("jobs = %+v, want one for sub-gl", q.jobs)
+	}
+	if q.jobs[0].Idem != "grade:webhook:sub-gl:g1t1ab5ha" {
+		t.Errorf("idem = %q", q.jobs[0].Idem)
+	}
+	sub, _ := st.GetSubmission(context.Background(), "sub-gl")
+	if sub.LatestCommit != "g1t1ab5ha" {
+		t.Errorf("LatestCommit = %q, want g1t1ab5ha", sub.LatestCommit)
+	}
+}
+
+func TestWebhookGitLabWrongToken401(t *testing.T) {
+	q := &spyQueue{}
+	srv, _ := newWebhookServer(t, q, true)
+
+	body := gitlabPush("cs101", "hw1-carol", "g1t1ab5ha")
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	req.Header.Set("X-Gitlab-Token", "not-the-secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token status = %d, want 401", rec.Code)
+	}
+	if len(q.jobs) != 0 {
+		t.Errorf("no jobs on wrong token, got %d", len(q.jobs))
+	}
+}
+
+func TestWebhookGitLabMissingToken401(t *testing.T) {
+	q := &spyQueue{}
+	srv, _ := newWebhookServer(t, q, true)
+
+	body := gitlabPush("cs101", "hw1-carol", "g1t1ab5ha")
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing token status = %d, want 401", rec.Code)
+	}
+}
+
+func TestWebhookGitLabUnknownRepo204(t *testing.T) {
+	q := &spyQueue{}
+	srv, _ := newWebhookServer(t, q, true)
+
+	body := gitlabPush("cs101", "not-tracked", "g1t1ab5ha")
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	req.Header.Set("X-Gitlab-Token", testWebhookSecret)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("unknown repo status = %d, want 204", rec.Code)
+	}
+	if len(q.jobs) != 0 {
+		t.Errorf("no jobs for untracked repo, got %d", len(q.jobs))
+	}
+}
+
+func TestWebhookGitLabNonPush204(t *testing.T) {
+	q := &spyQueue{}
+	srv, _ := newWebhookServer(t, q, true)
+
+	// A tag_push event (valid token) must be ignored with 204.
+	body := `{"object_kind":"tag_push","checkout_sha":"g1t1ab5ha","project":{"name":"hw1-carol","path_with_namespace":"cs101/hw1-carol"}}`
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(body))
+	req.Header.Set("X-Gitlab-Token", testWebhookSecret)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("tag_push status = %d, want 204", rec.Code)
+	}
+	if len(q.jobs) != 0 {
+		t.Errorf("no jobs for non-push event, got %d", len(q.jobs))
 	}
 }

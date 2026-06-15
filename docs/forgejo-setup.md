@@ -198,26 +198,28 @@ curl -s -X POST http://localhost:8080/classrooms/<classroom-id>/assignments/<ass
 
 With a webhook configured, a student's `git push` re-runs grading automatically and
 their `/me` page updates live. Quad registers the webhook on each repo when
-`QUAD_WEBHOOK_URL` is set, signing deliveries with the secret below.
+`QUAD_WEBHOOK_BASE_URL` is set, appending `/webhooks/forgejo` per repo and signing
+deliveries with the secret below.
 
 ```sh
-# FULL receiver URL, used verbatim. It must include the /webhooks/forgejo path and
-# be reachable BY THE FORGEJO SERVER. The secret must match on both sides.
-export QUAD_WEBHOOK_URL=https://your-quad-host/webhooks/forgejo
+# Public BASE URL of Quad. Quad appends /webhooks/forgejo per repo. It must be
+# reachable BY THE FORGEJO SERVER. The secret must match on both sides.
+export QUAD_WEBHOOK_BASE_URL=https://your-quad-host
 export QUAD_FORGEJO_WEBHOOK_SECRET=$(openssl rand -hex 32)   # also covers host: gitea
 ```
 
-Restart Quad and confirm the startup summary shows the webhook URL and
+Restart Quad and confirm the startup summary shows the webhook base URL and
 `webhook secret [forgejo]: set` (and `[gitea]: set`). New provisions register the
 webhook automatically; re-provision existing repos, or add the webhook by hand in
-the repo's **Settings → Webhooks** pointing at the same URL and secret.
+the repo's **Settings → Webhooks** pointing at `<base>/webhooks/forgejo` with the
+same secret.
 
-> **Reachability gotcha (read this).** `QUAD_WEBHOOK_URL` is called by the **Forgejo
+> **Reachability gotcha (read this).** The webhook is called by the **Forgejo
 > server**, not your laptop. If Forgejo runs in a container, `localhost` is the
 > container itself — use the host address, e.g.
-> `http://host.docker.internal:8080/webhooks/forgejo` on Docker Desktop, or the
-> machine's LAN IP. Test reachability from inside the container
-> (`curl` the URL) before debugging anything else.
+> `http://host.docker.internal:8080` on Docker Desktop, or the machine's LAN IP.
+> Test reachability from inside the container (`curl <base>/webhooks/forgejo`)
+> before debugging anything else.
 
 ---
 

@@ -17,32 +17,65 @@ import (
 	"github.com/quad/quad/pkg/adapter"
 )
 
-// pushPayload is the subset of a host push event Quad needs. GitHub puts the org
-// in owner.login; Gitea/Forgejo use owner.username — we accept either.
+// pushPayload is the subset of a host push event Quad needs across all hosts.
+// GitHub/Gitea/Forgejo use repository.{name, owner.login|username} + after;
+// GitLab uses project.{name, path_with_namespace} + checkout_sha and marks the
+// event type in object_kind.
 type pushPayload struct {
-	After      string `json:"after"`
-	Repository struct {
+	ObjectKind  string `json:"object_kind"`  // GitLab: "push" / "tag_push" / …
+	After       string `json:"after"`        // GitHub/Gitea/Forgejo head sha
+	CheckoutSHA string `json:"checkout_sha"` // GitLab head sha
+	Repository  struct {
 		Name  string `json:"name"`
 		Owner struct {
 			Login    string `json:"login"`
 			Username string `json:"username"`
 		} `json:"owner"`
 	} `json:"repository"`
+	Project struct {
+		Name              string `json:"name"`
+		PathWithNamespace string `json:"path_with_namespace"`
+		Namespace         string `json:"namespace"`
+	} `json:"project"`
 }
 
-func (p pushPayload) namespace() string {
-	if p.Repository.Owner.Login != "" {
-		return p.Repository.Owner.Login
+// repo extracts (namespace, name, headSHA) for the given host. The fields a host
+// populates differ, so the host selects which to read.
+func (p pushPayload) repo(host adapter.Host) (namespace, name, sha string) {
+	if host == adapter.HostGitLab {
+		ns, base := splitLastSlash(p.Project.PathWithNamespace)
+		if base == "" {
+			base = p.Project.Name
+		}
+		if ns == "" {
+			ns = p.Project.Namespace
+		}
+		return ns, base, p.CheckoutSHA
 	}
-	return p.Repository.Owner.Username
+	ns := p.Repository.Owner.Login
+	if ns == "" {
+		ns = p.Repository.Owner.Username
+	}
+	return ns, p.Repository.Name, p.After
 }
 
-// handleWebhook receives a host push delivery, verifies its HMAC signature
-// against the per-host secret, maps the repo to a submission, and (if a grader is
-// configured) enqueues a regrade keyed to the head commit so each push grades once.
+// splitLastSlash splits "group/project" (or "group/sub/project") into the
+// namespace (everything before the last "/") and the final path segment.
+func splitLastSlash(path string) (dir, base string) {
+	i := strings.LastIndex(path, "/")
+	if i < 0 {
+		return "", path
+	}
+	return path[:i], path[i+1:]
+}
+
+// handleWebhook receives a host push delivery, authenticates it against the
+// per-host secret (HMAC for GitHub/Gitea/Forgejo; the X-Gitlab-Token header for
+// GitLab), maps the repo to a submission, and (if a grader is configured) enqueues
+// a regrade keyed to the head commit so each push grades once.
 //
-// It is public by necessity — the Git host calls it — so the HMAC signature is the
-// only trust boundary. No secret configured for a host means we cannot trust any
+// It is public by necessity — the Git host calls it — so the secret is the only
+// trust boundary. No secret configured for a host means we cannot trust any
 // delivery for it, so we 404.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	host := adapter.Host(r.PathValue("host"))
@@ -72,9 +105,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GitLab marks the event type explicitly; ignore non-push events (tag_push,
+	// issues, etc.). GitHub/Gitea/Forgejo non-push deliveries carry no head commit
+	// and fall through to the sha check below.
+	if host == adapter.HostGitLab && payload.ObjectKind != "push" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Non-push deliveries (e.g. ping) and branch deletions carry no actionable head
 	// commit. Acknowledge them without doing anything.
-	ns, name, sha := payload.namespace(), payload.Repository.Name, payload.After
+	ns, name, sha := payload.repo(host)
 	if name == "" || sha == "" || isZeroSHA(sha) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -113,10 +154,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// verifyWebhookSignature checks the delivery's HMAC-SHA256 over body using a
-// constant-time compare. GitHub sends X-Hub-Signature-256: sha256=<hex>;
-// Gitea/Forgejo send X-Gitea-Signature / X-Forgejo-Signature: <hex>.
+// verifyWebhookSignature authenticates a delivery per host's scheme:
+//   - GitLab does NOT HMAC-sign; it echoes the configured secret verbatim in the
+//     X-Gitlab-Token header. We compare it to the secret in constant time.
+//   - GitHub sends X-Hub-Signature-256: sha256=<hex> (HMAC-SHA256 over the body).
+//   - Gitea/Forgejo send X-Gitea-Signature / X-Forgejo-Signature: <hex> (same HMAC).
 func verifyWebhookSignature(host adapter.Host, h http.Header, body []byte, secret string) bool {
+	if host == adapter.HostGitLab {
+		got := []byte(h.Get("X-Gitlab-Token"))
+		return len(got) > 0 && hmac.Equal(got, []byte(secret))
+	}
+
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	want := mac.Sum(nil)

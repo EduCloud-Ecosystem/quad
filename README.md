@@ -34,7 +34,7 @@ products. Quad targets the gap none of them fill:
 | **GitHub** | ✅ Supported | GitHub App + OAuth — the familiar on-ramp. See [`docs/github-setup.md`](docs/github-setup.md). |
 | **Forgejo** | ✅ Supported | Self-hosted; token + OAuth2. See [`docs/forgejo-setup.md`](docs/forgejo-setup.md). |
 | **Gitea** | ✅ Supported | Same adapter family as Forgejo (shared `/api/v1`); declare `host: gitea`. |
-| **GitLab** | 🔜 Planned | Its own adapter — not yet implemented. |
+| **GitLab** | ✅ Supported | gitlab.com or self-hosted; PAT + OAuth2 (`/api/v4`). See [`docs/gitlab-setup.md`](docs/gitlab-setup.md). |
 
 A single deployment can serve classrooms on multiple hosts at once; each classroom
 carries its own `host`. Moving courses from GitHub to a self-hosted instance is a
@@ -78,6 +78,8 @@ From here, pick a host to back real classrooms:
   [`docs/github-setup.md`](docs/github-setup.md)
 - **Forgejo / Gitea** — self-hosted, data stays on your infrastructure:
   [`docs/forgejo-setup.md`](docs/forgejo-setup.md)
+- **GitLab** — gitlab.com or self-hosted:
+  [`docs/gitlab-setup.md`](docs/gitlab-setup.md)
 - **Moving GitHub → self-hosted** later, without rebuilding materials:
   [`docs/migrating-github-to-forgejo.md`](docs/migrating-github-to-forgejo.md)
 
@@ -221,12 +223,12 @@ The redirect URI registered with the OAuth2 app must be the same
 a single `/auth/callback` endpoint serves all hosts — the state parameter carries
 the host so callbacks are routed correctly.
 
-When both GitHub and Forgejo resolvers are configured, operator login defaults to
-GitHub. To choose another (or to be explicit), set `QUAD_OPERATOR_HOST` to
-`github`, `forgejo`, or `gitea`:
+When multiple resolvers are configured, operator login defaults to GitHub. To
+choose another (or to be explicit), set `QUAD_OPERATOR_HOST` to `github`,
+`forgejo`, `gitea`, or `gitlab`:
 
 ```sh
-export QUAD_OPERATOR_HOST=forgejo   # github | forgejo | gitea
+export QUAD_OPERATOR_HOST=forgejo   # github | forgejo | gitea | gitlab
 ```
 
 Because Forgejo and Gitea are one adapter family sharing the same API, configuring
@@ -323,30 +325,34 @@ isolation** (only a timeout) and is for trusted/local material only.
 
 ## Webhooks (auto-regrade on push)
 
-When `QUAD_WEBHOOK_URL` is set, Quad registers a push webhook on each provisioned
-repo. A student `git push` then hits the receiver at `POST /webhooks/{host}`, which
-verifies the delivery's HMAC signature and enqueues a regrade keyed to the head
+When `QUAD_WEBHOOK_BASE_URL` is set, Quad registers a push webhook on each
+provisioned repo at `<base>/webhooks/<host>` — so a delivery always reaches the
+handler that knows how to verify that host. A student `git push` then hits the
+receiver, which authenticates the delivery (HMAC signature for GitHub/Gitea/Forgejo;
+the `X-Gitlab-Token` header for GitLab) and enqueues a regrade keyed to the head
 commit (so each push grades once; a new commit regrades).
 
 ```sh
-# Full receiver URL, used verbatim — include the host segment matching your
-# classroom host. It must be reachable BY THE GIT HOST, not just by you.
-export QUAD_WEBHOOK_URL=https://your-host/webhooks/forgejo   # or /webhooks/github, /webhooks/gitea
+# Public BASE URL of this Quad instance. Quad appends /webhooks/<host> per repo.
+# It must be reachable BY THE GIT HOST, not just by you.
+export QUAD_WEBHOOK_BASE_URL=https://your-host   # (QUAD_WEBHOOK_URL is a deprecated alias)
 
 # Per-host signing secret; set the same value in the host's webhook config.
 export QUAD_FORGEJO_WEBHOOK_SECRET=$(openssl rand -hex 32)   # covers forgejo AND gitea
 export QUAD_GITHUB_WEBHOOK_SECRET=$(openssl rand -hex 32)
+export QUAD_GITLAB_WEBHOOK_SECRET=$(openssl rand -hex 32)
 ```
 
 A host with no configured secret has its deliveries rejected (the receiver returns
-`404`); a delivery whose signature doesn't match returns `401`. The startup summary
-prints the webhook URL and the set/unset state of each host's secret.
+`404`); a delivery that fails authentication returns `401`. The startup summary
+prints the webhook base URL and the set/unset state of each host's secret.
 
-> **Reachability gotchas.** `localhost` from inside a Forgejo container is the
+> **Reachability gotchas.** `localhost` from inside a Forgejo/GitLab container is the
 > container, not your machine — use the host address (e.g.
-> `http://host.docker.internal:8080/webhooks/forgejo` on Docker Desktop). Cloud
-> GitHub cannot reach `localhost` at all; use a tunnel for local testing. See the
-> [Forgejo](docs/forgejo-setup.md) and [GitHub](docs/github-setup.md) guides.
+> `http://host.docker.internal:8080` on Docker Desktop). Cloud GitHub and gitlab.com
+> cannot reach `localhost` at all; use a tunnel for local testing. See the
+> [Forgejo](docs/forgejo-setup.md), [GitHub](docs/github-setup.md), and
+> [GitLab](docs/gitlab-setup.md) guides.
 
 ## Student experience
 

@@ -93,9 +93,9 @@ func TestWorkerCreateRepo(t *testing.T) {
 
 	fa := &fakeAdapter{}
 	w := &Worker{
-		Store:      st,
-		Adapters:   map[adapter.Host]adapter.Adapter{adapter.HostGitHub: fa},
-		WebhookURL: "https://quad.example/webhook",
+		Store:          st,
+		Adapters:       map[adapter.Host]adapter.Adapter{adapter.HostGitHub: fa},
+		WebhookBaseURL: "https://quad.example",
 	}
 	did, err := w.RunOnce(ctx)
 	if err != nil {
@@ -111,8 +111,9 @@ func TestWorkerCreateRepo(t *testing.T) {
 	if fa.collaborator != "bob" || fa.role != adapter.RoleWrite {
 		t.Fatalf("collaborator = %q role = %q, want bob/write", fa.collaborator, fa.role)
 	}
-	if fa.webhookURL != "https://quad.example/webhook" {
-		t.Fatalf("webhookURL = %q", fa.webhookURL)
+	// The webhook URL is per-host: <base>/webhooks/<host>.
+	if fa.webhookURL != "https://quad.example/webhooks/github" {
+		t.Fatalf("webhookURL = %q, want https://quad.example/webhooks/github", fa.webhookURL)
 	}
 
 	sub, _ := st.GetSubmission(ctx, "s1")
@@ -123,6 +124,44 @@ func TestWorkerCreateRepo(t *testing.T) {
 	// Queue should now be drained.
 	if did, _ := w.RunOnce(ctx); did {
 		t.Fatal("expected no more jobs")
+	}
+}
+
+// TestWorkerWebhookURLPerHost verifies the worker derives the webhook URL from the
+// classroom's host, so each host's repos point at the handler that can verify them
+// (a fix for the prior single-URL behaviour that broke multi-host deployments).
+func TestWorkerWebhookURLPerHost(t *testing.T) {
+	cases := []struct {
+		host adapter.Host
+		want string
+	}{
+		{adapter.HostGitHub, "https://quad.example/webhooks/github"},
+		{adapter.HostForgejo, "https://quad.example/webhooks/forgejo"},
+		{adapter.HostGitea, "https://quad.example/webhooks/gitea"},
+		{adapter.HostGitLab, "https://quad.example/webhooks/gitlab"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.host), func(t *testing.T) {
+			ctx := context.Background()
+			st := memory.New()
+			_ = st.CreateClassroom(ctx, &store.Classroom{ID: "c1", Host: tc.host, HostNamespace: "org"})
+			_ = st.CreateAssignment(ctx, &store.Assignment{ID: "a1", ClassroomID: "c1", Slug: "hw1", TemplateRef: adapter.TemplateRef{Host: tc.host, Namespace: "org", Name: "tmpl"}})
+			_ = st.CreateRosterEntry(ctx, &store.RosterEntry{ID: "r1", ClassroomID: "c1", Host: tc.host, HostUsername: "bob"})
+			_ = st.CreateSubmission(ctx, &store.Submission{ID: "s1", AssignmentID: "a1", RosterEntryID: "r1", Status: "provisioning"})
+
+			queue := NewService(st)
+			_ = queue.Enqueue(ctx, JobCreateRepo, "s1", "repo:s1")
+
+			fa := &fakeAdapter{}
+			// Trailing slash on the base also exercises the TrimRight.
+			w := &Worker{Store: st, Adapters: map[adapter.Host]adapter.Adapter{tc.host: fa}, WebhookBaseURL: "https://quad.example/"}
+			if _, err := w.RunOnce(ctx); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if fa.webhookURL != tc.want {
+				t.Fatalf("webhook URL = %q, want %q", fa.webhookURL, tc.want)
+			}
+		})
 	}
 }
 
